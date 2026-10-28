@@ -998,6 +998,7 @@ def _flash_attn_fwd(
     num_sms = get_num_sms_for_selection(device.index, arch)
     # Caller-built varlen scheduler metadata assumes 1CTA tiles and the default pack_gqa.
     hd256_2cta_varlen_ok = cu_seqlens_q is None or scheduler_metadata is None
+    hd256_unpacked_for_2cta = False
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
         if (
@@ -1010,8 +1011,9 @@ def _flash_attn_fwd(
         ):
             # Prefer 2CTA over cp.async-Q PackGQA for hd256.
             pack_gqa = False
+            hd256_unpacked_for_2cta = True
 
-    fwd_cfg = _get_fwd_config(
+    fwd_cfg_kwargs = dict(
         arch=arch,
         head_dim=head_dim,
         head_dim_v=head_dim_v,
@@ -1033,6 +1035,7 @@ def _flash_attn_fwd(
         mma_pv_is_rs=mma_pv_is_rs,
         intra_wg_overlap=intra_wg_overlap,
     )
+    fwd_cfg = _get_fwd_config(**fwd_cfg_kwargs)
     mla_fwd_cls = None
     if qv is not None:
         mla_1cta, mla_fwd_cls, fwd_cfg = _mla_fwd_plan(
@@ -1062,6 +1065,38 @@ def _flash_attn_fwd(
     max_m_blocks_leq_one = seqlen_q_packgqa <= q_stage * tile_m
 
     is_split_kv = num_splits > 1
+    # TODO: Move this scheduler-selection logic once the stack in
+    # https://github.com/Dao-AILab/flash-attention/pull/2733 lands.
+    # Padded slots incur empty CTAs in the single-tile grid. If slots may outnumber
+    # real M tiles, use DynamicPersistentVarlenScheduler (SM-count grid, real tiles only).
+    # Decide from the selected config so other calls keep their plan.
+    use_persistent_varlen = (
+        arch // 10 in [10, 11]
+        and cu_seqlens_q is not None
+        and mask_mod is None
+        and not use_block_sparsity
+        and scheduler_metadata is None
+        and not disable_scheduler_metadata
+        and qv is None
+        and not is_split_kv
+        and not max_m_blocks_leq_one
+        # CLC runs for varlen GQA when requested and keeps its own scheduler
+        and not (requested_use_clc_scheduler and qhead_per_kvhead > 1)
+        and batch_size * q_stage * tile_m > total_q * (qhead_per_kvhead if pack_gqa else 1)
+        and DynamicPersistentVarlenScheduler.max_claimable_tiles(
+            total_q, batch_size, q_stage * tile_m, num_head, num_head_kv, pack_gqa, 1
+        ) < DynamicPersistentVarlenScheduler.MAX_TILES
+    )
+    if use_persistent_varlen and hd256_unpacked_for_2cta:
+        # The dynamic scheduler takes 1CTA tiles, where hd256 prefers PackGQA: re-plan with it.
+        pack_gqa = True
+        fwd_cfg = _get_fwd_config(**{**fwd_cfg_kwargs, "pack_gqa": True, "num_splits": 1})
+        tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
+        q_stage = fwd_cfg.q_stage
+        mma_pv_is_rs = fwd_cfg.mma_pv_is_rs
+        intra_wg_overlap = fwd_cfg.intra_wg_overlap
+        seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
+        max_m_blocks_leq_one = seqlen_q_packgqa <= q_stage * tile_m
     # Single-M-block hd256 2CTA halves each CTA's K/V loads; worth it while the doubled
     # grid fits in one wave.
     hd256_decode_2cta = (
@@ -1083,7 +1118,10 @@ def _flash_attn_fwd(
         arch // 10 in [10, 11]
         and not requested_disable_2cta
         and not is_split_kv
-        and (cu_seqlens_q is None or (is_hdim256 and hd256_2cta_varlen_ok))
+        and (
+            cu_seqlens_q is None
+            or (is_hdim256 and hd256_2cta_varlen_ok and not use_persistent_varlen)
+        )
         and seqused_q is None
         and not use_block_sparsity
         and page_size in [None, 128]
@@ -1262,6 +1300,13 @@ def _flash_attn_fwd(
     if qv is not None:
         # the MLA kernels write all num_splits partials (no per-batch dynamic split counts)
         assert scheduler_metadata is None, "scheduler_metadata is not supported with qv"
+    if use_persistent_varlen:
+        # The dynamic scheduler computes tile counts on device and resets its semaphore at exit:
+        # no prepare kernel is needed. Allocate a zeroed semaphore per call; callers can reuse
+        # their own via scheduler_metadata to avoid the fill launch.
+        scheduler_metadata = SchedulerMetadataTensorsTorch(
+            tile_count_semaphore=torch.zeros(1, dtype=torch.int32, device=device)
+        )
     if (
         is_split_kv
         and is_varlen_q
